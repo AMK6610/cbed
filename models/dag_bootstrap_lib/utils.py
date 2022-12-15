@@ -32,7 +32,7 @@ def run_gies_boot(n_boot, data_path, intervention_path, dags_path, seed, delete=
             pass
     if not os.path.exists(dags_path):
         os.mkdir(dags_path)
-    rfile = os.path.join('models', 'dag_bootstrap_lib', 'run_gies.r')
+    rfile = os.path.join('models', 'cbed', 'models', 'dag_bootstrap_lib', 'run_gies.r')
     r_command = 'Rscript {} {} {} {} {} {}'.format(rfile, n_boot, data_path, intervention_path, seed, dags_path)
     os.system(r_command)
 

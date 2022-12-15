@@ -12,8 +12,8 @@ import numpy as np
 import causaldag as cd
 
 from .posterior_model import PosteriorModel
-from utils import binary_entropy
-from models.dag_bootstrap_lib import utils
+from ..utils import binary_entropy
+from .dag_bootstrap_lib import utils
 
 
 def logmeanexp(A, axis):

@@ -28,12 +28,11 @@ from jax import random
 from jax.tree_util import tree_map
 
 import igraph as ig
-from utils import binary_entropy
+from ..utils import binary_entropy, utils
 from scipy.special import logsumexp
 from scipy import special
 import causaldag as cd
 from tqdm import tqdm
-import utils
 import xarray as xr
 import pickle
 
