@@ -18,6 +18,11 @@ class ReplayBuffer(object):
         else:
             self.n_int += len(data.samples)
 
+    def merge(self, buffer):
+        self.buffer.extend(buffer.buffer)
+        self.n_obs += buffer.n_obs
+        self.n_int += buffer.n_int
+
     def reset(self):
         self.buffer = []
 
