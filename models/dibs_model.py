@@ -1,40 +1,35 @@
 import os
+import pickle
 
+import causaldag as cd
+import igraph as ig
+import jax.numpy as jnp
 import numpy as np
-
-from .posterior_model import PosteriorModel
+import xarray as xr
+from jax import random
+from jax import vmap
+from jax.tree_util import tree_map
+from scipy.special import logsumexp
+from tqdm import tqdm
 
 from .dibs.eval.target import make_graph_model
-from .dibs.models.linearGaussianEquivalent import BGe, BGeJAX
-from .dibs.models.linearGaussian import LinearGaussian, LinearGaussianJAX
-from .dibs.models.nonlinearGaussian import DenseNonlinearGaussianJAX
 from .dibs.inference import MarginalDiBS, JointDiBS
 from .dibs.kernel import (
     FrobeniusSquaredExponentialKernel,
     JointAdditiveFrobeniusSEKernel,
 )
+from .dibs.models.linearGaussian import LinearGaussianJAX
+from .dibs.models.linearGaussianEquivalent import BGeJAX
+from .dibs.models.nonlinearGaussian import DenseNonlinearGaussianJAX
 from .dibs.utils.func import (
     particle_marginal_empirical,
-    particle_marginal_mixture,
     particle_joint_empirical,
     particle_joint_mixture,
 )
 from .dibs.utils.graph import elwise_acyclic_constr_nograd
-from .dibs.utils.tree import tree_shapes, tree_select, tree_index
-
-import jax.numpy as jnp
-from jax import jit, vmap
-from jax import random
-from jax.tree_util import tree_map
-
-import igraph as ig
-from ..utils import binary_entropy, utils
-from scipy.special import logsumexp
-from scipy import special
-import causaldag as cd
-from tqdm import tqdm
-import xarray as xr
-import pickle
+from .dibs.utils.tree import tree_select, tree_index
+from .posterior_model import PosteriorModel
+from ..utils import utils
 
 
 class DiBS_BGe(PosteriorModel):
@@ -175,11 +170,11 @@ class DiBS_BGe(PosteriorModel):
 
 class DiBS_Linear(PosteriorModel):
     def __init__(self, args, precision_matrix = None):
-        self.key = random.PRNGKey(123)
+        self.key = random.PRNGKey(args.seed)
         self.num_nodes = args.num_nodes
         self.precision_matrix = precision_matrix
         self.ensemble = False
-        self.reset_after_each_update = True
+        self.reset_after_each_update = not args.warm_start
 
         graph_model = make_graph_model(
             n_vars=args.num_nodes,
@@ -197,41 +192,44 @@ class DiBS_Linear(PosteriorModel):
             """log p(G) using edge probabilities as G"""
             return graph_model.unnormalized_log_prob_soft(soft_g=single_w_prob)
 
-        def log_likelihood(single_w, single_theta, x, interv_targets, rng):
+        def log_likelihood(single_w, single_theta, single_sigma, x, interv_targets, rng):
             log_prob_theta = self.inference_model.log_prob_parameters(theta=single_theta, w=single_w)
             log_lik = self.inference_model.log_likelihood(
-                w=single_w, theta=single_theta, data=x, interv_targets=interv_targets
+                w=single_w, theta=single_theta, sigma=single_sigma, data=x, interv_targets=interv_targets
             )
             return log_prob_theta + log_lik
 
         self.eltwise_log_prob = vmap(
-            lambda g, theta, x, interv_targets: log_likelihood(
-                g, theta, x, interv_targets, None
+            lambda g, theta, sigma, x, interv_targets: log_likelihood(
+                g, theta, sigma, x, interv_targets, None
             ),
-            (0, 0, None, None),
+            (0, 0, 0, None, None),
             0,
         )
 
         # SVGD + DiBS hyperparams
-        self.n_particles = 20
+        self.n_particles = args.n_particles
         self.n_steps = lambda t: 3000 #int(100*t/15)
 
         # initialize kernel and algorithm
         kernel = JointAdditiveFrobeniusSEKernel(
-            h_latent=5.0, h_theta=500.0
+            h_latent=args.h_latent, h_theta=args.h_theta, h_sigma=args.h_sigma
         )
 
         self.model = JointDiBS(
             kernel=kernel,
             target_log_prior=log_prior,
             target_log_joint_prob=log_likelihood,
-            alpha_linear=0.1,
+            alpha_linear=args.alpha_linear,
         )
 
-        self.key, subk = random.split(self.key)
-        self.particles_z, self.particles_w = self.model.sample_initial_random_particles(
-            key=subk, n_particles=self.n_particles, model = self.inference_model, n_vars=self.num_nodes
-        )
+        if self.reset_after_each_update or (not hasattr(self, 'particles_z')):
+            self.key, subk = random.split(self.key)
+            self.particles_z, self.particles_w, self.particles_sigma = self.model.sample_initial_random_particles(
+                key=subk, n_particles=self.n_particles, model = self.inference_model, n_vars=self.num_nodes
+            )
+
+        self.args = args
 
     def update(self, data):
         data_samples = jnp.array(data.samples)
@@ -240,18 +238,20 @@ class DiBS_Linear(PosteriorModel):
         interv_targets = interv_targets.at[int_idx, data.nodes[int_idx]].set(True)
 
         if self.reset_after_each_update:
-            self.key, subk = random.split(self.key)
-            self.particles_z, self.particles_w = self.model.sample_initial_random_particles(
-            key=subk, n_particles=self.n_particles, model = self.inference_model, n_vars=self.num_nodes
-            )
+            self.__init__(self.args)
+            # self.key, subk = random.split(self.key)
+            # self.particles_z, self.particles_w, self.particles_sigma = self.model.sample_initial_random_particles(
+            # key=subk, n_particles=self.n_particles, model = self.inference_model, n_vars=self.num_nodes
+            # )
 
         self.key, subk = random.split(self.key)
 
-        self.particles_z, self.particles_w = self.model.sample_particles(
+        self.particles_z, self.particles_w, self.particles_sigma = self.model.sample_particles(
             key=subk,
             n_steps=self.n_steps(data_samples.shape[0]),
             init_particles_z=self.particles_z,
             init_particles_theta=self.particles_w,
+            init_particles_sigma=self.particles_sigma,
             data=data_samples,
             interv_targets=interv_targets,
         )
@@ -261,9 +261,10 @@ class DiBS_Linear(PosteriorModel):
         particles_g = self.model.particle_to_g_lim(self.particles_z)
         # self.dibs_empirical = particle_marginal_empirical(particles_g)
         self.posterior = particle_joint_mixture(
-            particles_g, self.particles_w, self.eltwise_log_prob, data, interv_targets
+            particles_g, self.particles_w, self.particles_sigma, self.eltwise_log_prob, data, interv_targets
         )
         self.dags = self.posterior[0]
+        self.sigma = self.posterior[2]
 
     def sample(self, num_samples):
         self.key, subk = random.split(self.key)
@@ -287,10 +288,10 @@ class DiBS_Linear(PosteriorModel):
 
 class DiBS_NonLinear(PosteriorModel):
     def __init__(self, args):
-        self.key = random.PRNGKey(123)
+        self.key = random.PRNGKey(args.seed)
         self.num_nodes = args.num_nodes
         self.ensemble = True
-        self.reset_after_each_update = False
+        self.reset_after_each_update = args.warm_start
 
         graph_model = make_graph_model(
             n_vars=args.num_nodes,
@@ -306,19 +307,19 @@ class DiBS_NonLinear(PosteriorModel):
             """log p(G) using edge probabilities as G"""
             return graph_model.unnormalized_log_prob_soft(soft_g=single_w_prob)
 
-        def log_likelihood(single_w, single_theta, x, interv_targets, rng):
+        def log_likelihood(single_w, single_theta, single_sigma, x, interv_targets, rng):
             log_prob_theta = self.inference_model.log_prob_parameters(theta=single_theta, w=single_w)
             log_lik = self.inference_model.log_likelihood(
-                w=single_w, theta=single_theta, data=x, interv_targets=interv_targets
+                w=single_w, theta=single_theta, sigma=single_sigma, data=x, interv_targets=interv_targets
             )
             return log_lik + log_prob_theta
 
 
         self.eltwise_log_prob_single = vmap(
-            lambda g, theta, x, interv_targets: self.inference_model.log_likelihood_single(
-                w=g, theta=theta, data=x, interv_targets=interv_targets
+            lambda g, theta, sigma, x, interv_targets: self.inference_model.log_likelihood_single(
+                w=g, theta=theta, sigma=sigma, data=x, interv_targets=interv_targets
             ),
-            (0, 0, None, None),
+            (0, 0, 0, None, None),
             0,
         )
 
@@ -328,7 +329,7 @@ class DiBS_NonLinear(PosteriorModel):
 
         # initialize kernel and algorithm
         kernel = JointAdditiveFrobeniusSEKernel(
-            h_latent=5.0, h_theta=500.0
+            h_latent=5.0, h_theta=500.0, h_sigma=1.0
         )
 
         self.model = JointDiBS(
@@ -339,7 +340,7 @@ class DiBS_NonLinear(PosteriorModel):
         )
 
         self.key, subk = random.split(self.key)
-        self.particles_z, self.particles_w = self.model.sample_initial_random_particles(
+        self.particles_z, self.particles_w, self.particles_sigma = self.model.sample_initial_random_particles(
             key=subk, n_particles=self.n_particles, model = self.inference_model, n_vars=self.num_nodes
         )
 
@@ -352,17 +353,18 @@ class DiBS_NonLinear(PosteriorModel):
 
         if self.reset_after_each_update:
             self.key, subk = random.split(self.key)
-            self.particles_z, self.particles_w = self.model.sample_initial_random_particles(
+            self.particles_z, self.particles_w, self.particles_sigma = self.model.sample_initial_random_particles(
             key=subk, n_particles=self.n_particles, model = self.inference_model, n_vars=self.num_nodes
             )
 
         self.key, subk = random.split(self.key)
 
-        self.particles_z, self.particles_w = self.model.sample_particles(
+        self.particles_z, self.particles_w, self.particles_sigma = self.model.sample_particles(
             key=subk,
             n_steps=self.n_steps,
             init_particles_z=self.particles_z,
             init_particles_theta=self.particles_w,
+            init_particles_sigma=self.particles_sigma,
             data=data_samples,
             interv_targets=interv_targets,
         )
@@ -370,13 +372,14 @@ class DiBS_NonLinear(PosteriorModel):
 
     def update_dist(self):
         particles_g = self.model.particle_to_g_lim(self.particles_z)
-        _posterior = particle_joint_empirical(particles_g, self.particles_w)
+        _posterior = particle_joint_empirical(particles_g, self.particles_w, self.particles_sigma)
 
         is_dag = elwise_acyclic_constr_nograd(_posterior[0], self.num_nodes) == 0
         self.all_graphs = _posterior[0]
         self.dags = _posterior[0][is_dag, :, :]
+        self.sigma = _posterior[2][is_dag, :]
 
-        self.posterior = self.dags, tree_select(_posterior[1], is_dag), _posterior[2][is_dag] - logsumexp(_posterior[2][is_dag])
+        self.posterior = self.dags, tree_select(_posterior[1], is_dag), tree_select(_posterior[2], is_dag), _posterior[3][is_dag] - logsumexp(_posterior[3][is_dag])
         self.full_posterior = _posterior
 
     def sample(self, num_samples):
