@@ -28,7 +28,7 @@ class DagBootstrap(PosteriorModel):
         self.ensemble = True
 
         self.num_nodes = args.num_nodes
-        self.num_bootstraps = 100
+        self.num_bootstraps = args.n_bootstraps
         self.group_interventions = args.group_interventions
         self.seed = args.seed
 
