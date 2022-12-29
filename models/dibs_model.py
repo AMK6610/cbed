@@ -324,19 +324,19 @@ class DiBS_NonLinear(PosteriorModel):
         )
 
         # SVGD + DiBS hyperparams
-        self.n_particles = 20
+        self.n_particles = args.n_particles
         self.n_steps = args.dibs_steps
 
         # initialize kernel and algorithm
         kernel = JointAdditiveFrobeniusSEKernel(
-            h_latent=5.0, h_theta=500.0, h_sigma=1.0
+            h_latent=args.h_latent, h_theta=args.h_theta, h_sigma=args.h_sigma
         )
 
         self.model = JointDiBS(
             kernel=kernel,
             target_log_prior=log_prior,
             target_log_joint_prob=log_likelihood,
-            alpha_linear=0.05,
+            alpha_linear=args.alpha_linear,
         )
 
         self.key, subk = random.split(self.key)
