@@ -392,7 +392,7 @@ class DiBS_NonLinear(PosteriorModel):
         sampled_particles = random.categorical(
             key=subk, logits=self.posterior[3], shape=[num_samples]
         )
-        return self.model.particle_to_g_lim(self.particles_z)[sampled_particles], self.particles_w[sampled_particles]
+        return self.model.particle_to_g_lim(self.particles_z)[sampled_particles], self.particles_w[sampled_particles], self.particles_sigma[sampled_particles]
 
     def sample_interventions(self, nodes, value_samplers, nsamples):
 
