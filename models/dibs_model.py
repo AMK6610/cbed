@@ -1,12 +1,13 @@
 import os
 import pickle
+from functools import partial
 
 import causaldag as cd
 import igraph as ig
 import jax.numpy as jnp
 import numpy as np
 import xarray as xr
-from jax import random
+from jax import random, lax, jit
 from jax import vmap
 from jax.tree_util import tree_map
 from scipy.special import logsumexp
@@ -263,8 +264,12 @@ class DiBS_Linear(PosteriorModel):
         self.posterior = particle_joint_mixture(
             particles_g, self.particles_w, self.particles_sigma, self.eltwise_log_prob, data, interv_targets
         )
-        self.dags = self.posterior[0]
-        self.sigma = self.posterior[2]
+
+        is_dag = elwise_acyclic_constr_nograd(self.posterior[0], self.num_nodes) == 0
+
+        self.dags = self.posterior[0][is_dag, :, :]
+        self.thetas = self.posterior[1][is_dag, :, :]
+        self.sigmas = self.posterior[2][is_dag, :]
 
     def sample(self, num_samples):
         self.key, subk = random.split(self.key)
@@ -385,7 +390,7 @@ class DiBS_NonLinear(PosteriorModel):
     def sample(self, num_samples):
         self.key, subk = random.split(self.key)
         sampled_particles = random.categorical(
-            key=subk, logits=self.posterior[2], shape=[num_samples]
+            key=subk, logits=self.posterior[3], shape=[num_samples]
         )
         return self.model.particle_to_g_lim(self.particles_z)[sampled_particles], self.particles_w[sampled_particles]
 
@@ -418,21 +423,47 @@ class DiBS_NonLinear(PosteriorModel):
     def log_prob(self, graphs):
         return vmap(self.log_prob_single, 0, 0)(graphs)
 
-    def interventional_likelihood(self, graph_ix, data, interventions, all_graphs = False):
+    def interventional_likelihood(
+        self, graph_ix, data, interventions, all_graphs=False, onehot=False
+    ):
         if all_graphs:
             posterior = self.full_posterior
         else:
             posterior = self.posterior
 
-        graph = posterior[0][graph_ix]
+        graph = posterior[0][graph_ix] # inner
         theta = tree_index(posterior[1], graph_ix)
+        sigma = tree_index(posterior[2], graph_ix)
 
         data = jnp.array(data)
         interv_targets = jnp.zeros(data.shape[-1]).astype(bool)
         if interventions is not None:
-            nodes = list(interventions.keys())[0]
-            interv_targets = interv_targets.at[nodes].set(True)
-        return self.eltwise_log_prob_single(graph, theta, data, interv_targets)
+            if type(interventions) == dict:
+                nodes = list(interventions.keys())[0]
+            else:
+                nodes = interventions
+
+            if onehot:
+                interv_targets = nodes
+            else:
+                interv_targets = interv_targets.at[jnp.int32(nodes)].set(True)
+
+        # print(f'data shape: {data.shape} interv_targets: {interv_targets.shape}')
+
+        # we nest the vmaps because we want to
+        # broadcast over 0 and 1 axes of data.
+        fn = lambda graph, theta, sigma, data, targets: self.eltwise_log_prob_single(graph, theta, sigma, data, targets)
+
+        res =  vmap(
+                    vmap(fn, (None, None, None, 0, None)
+                ),
+                (None, None, None, 1, None)
+        )(graph, theta, sigma, data, interv_targets)
+
+        # print(f'res shape: {res.shape}')
+
+        # nodes x samples x outer x inner x 1
+        return res
 
     def _update_likelihood(self, nodes, nsamples, value_samplers, datapoints):
         matrix = np.stack([
@@ -472,3 +503,108 @@ class DiBS_NonLinear(PosteriorModel):
             f.close()
         self.particles_w = tree_map(lambda arr: jnp.array(arr), self.particles_w)
         self.update_dist()
+
+    @partial(jit, static_argnames=('self', 'n_samples', 'deterministic', 'onehot'))
+    def _batch_interventional_samples(self, nodes, values, g_mats, thetas, toporders, subks, n_samples,
+                                      deterministic=False, onehot=False):
+
+        """
+		This is a jitted function which samples interventional data through ancestral sampling by iterating through
+		ensemble (particles, indexed by j//T) and designs in a batch (indexed by j%T).
+		Args:
+		designs [opt_batch_size, batch_size, 2]: Trainable parameter of designs
+		g_mats  [num_particles, d, d]: set of all adjacency matrices of all particles
+		toporders [num_particles, opt_batch_size, d]: Topological ordering corresponding to g_mats, repeated over axis 1 (opt_batch_size)
+		n_samples: number of samples to take per dag, design pair
+		Output:
+		datapoints [num_particles, batch_size, opt_batch_size, n_samples, d]: Interventioanl samples
+		"""
+
+        if not onehot:
+            print("Warning: There won't be any gradients with respect to nodes.")
+            nodes = jnp.int32(nodes)
+
+        B, T = values.shape
+
+        datapoints = lax.fori_loop(
+            0,
+            T * len(self.dags),
+            lambda j, arr: arr.at[j // T, j % T].set(
+                self.inference_model.new_sample_obs(
+                    key=subks[j % T, j // T],
+                    g_mat=g_mats[j // T],
+                    toporder=toporders[j // T],
+                    theta=tree_index(thetas, j // T),
+                    n_samples=n_samples,
+                    nodes=nodes[:, j % T],
+                    values=values[:, j % T],
+                    deterministic=deterministic,
+                    onehot=onehot
+                )
+            )
+            ,
+            jnp.zeros((len(self.dags), T, B, n_samples, self.num_nodes))
+        )
+
+        # Dags x T x B x N x D
+        return datapoints
+
+    def batch_interventional_samples(self, nodes, values, n_samples, deterministic=False, onehot=False):
+        # Collect interventional samples
+        # Bootstraps x Interventions x Samples x Nodes
+        _thetas = self.posterior[1]
+
+        B, T = values.shape
+
+        g_mats = []
+        toporders = []
+        thetas = []
+        for i, dag in enumerate(self.dags):
+            g = ig.Graph.Weighted_Adjacency(dag.tolist())
+            g_mat = jnp.array(g.get_adjacency().data)
+            g_mats.append(g_mat)
+            thetas.append(tree_index(_thetas, i))
+            toporders.append(g.topological_sorting())
+        toporders = jnp.array(toporders)
+        g_mats = jnp.array(g_mats)
+
+        toporders = toporders[:, None].repeat(B, 1)
+
+        # bulk fetch keys
+        keys = random.split(self.key, T * len(self.dags) + 1)
+        self.key = keys[0]
+        subks = keys[1:].reshape(T, len(self.dags), 2)
+
+        return self._batch_interventional_samples(nodes,
+                                                  values,
+                                                  g_mats,
+                                                  _thetas,
+                                                  toporders,
+                                                  subks,
+                                                  n_samples,
+                                                  deterministic=deterministic,
+                                                  onehot=onehot)
+
+    @partial(jit, static_argnames=('self', 'roll', 'onehot'))
+    def batch_likelihood(self, nodes, datapoints, roll=False, onehot=False):
+        # dags x designs x batch x samples x dims
+        like_fn = lambda nodes, data: self.likelihood(nodes, data, onehot=onehot)
+        logprobs = vmap(
+            like_fn, (0, 2)
+        )(nodes, datapoints)
+
+        return logprobs
+
+    def likelihood(self, nodes, datapoints, onehot=False):
+        # (20, 3, 100, 50)
+        # datapoints: dags x interventions x samples x nodes
+        like_fn = lambda graph_idx, data, nodes: self.interventional_likelihood(
+                        graph_ix=graph_idx, data=data, interventions=nodes,
+                    )
+
+        logprobs = vmap(
+            like_fn, (None, 1, 0)
+        )(jnp.arange(len(self.dags)), datapoints, nodes)
+        # print(f'logprobs shape: {logprobs.shape}')
+
+        return logprobs[..., 0].transpose(0, 2, 3, 1)
