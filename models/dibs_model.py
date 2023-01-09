@@ -264,19 +264,21 @@ class DiBS_Linear(PosteriorModel):
         self.posterior = particle_joint_mixture(
             particles_g, self.particles_w, self.particles_sigma, self.eltwise_log_prob, data, interv_targets
         )
-
         is_dag = elwise_acyclic_constr_nograd(self.posterior[0], self.num_nodes) == 0
 
         self.dags = self.posterior[0][is_dag, :, :]
         self.thetas = self.posterior[1][is_dag, :, :]
         self.sigmas = self.posterior[2][is_dag, :]
+        self.logits = self.posterior[3][is_dag]
+        self.is_dag = is_dag
 
     def sample(self, num_samples):
         self.key, subk = random.split(self.key)
         sampled_particles = random.categorical(
-            key=subk, logits=self.posterior[2], shape=[num_samples]
+            key=subk, logits=self.logits, shape=[num_samples]
         )
-        return self.model.particle_to_g_lim(self.particles_z)[sampled_particles]
+        graphs, thetas, sigmas = self.model.particle_to_g_lim(self.particles_z[self.is_dag])[sampled_particles], self.particles_w[sampled_particles], self.particles_sigma[sampled_particles]
+        return graphs, thetas, sigmas
 
     def log_prob_single(self, graph):
         particles, log_prob = self.posterior
