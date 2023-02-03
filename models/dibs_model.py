@@ -26,6 +26,7 @@ from .dibs.utils.func import (
     particle_marginal_empirical,
     particle_joint_empirical,
     particle_joint_mixture,
+    particle_marginal_mixture,
 )
 from .dibs.utils.graph import elwise_acyclic_constr_nograd
 from .dibs.utils.tree import tree_select, tree_index
@@ -35,12 +36,11 @@ from ..utils import utils
 
 class DiBS_BGe(PosteriorModel):
     def __init__(self, args, precision_matrix=None):
-        self.key = random.PRNGKey(123)
+        self.key = random.PRNGKey(args.seed)
         self.num_nodes = args.num_nodes
         self.precision_matrix = precision_matrix
-        self.dags = None
         self.ensemble = False
-        self.reset_after_each_update = True
+        self.reset_after_each_update = not args.warm_start
 
         graph_model = make_graph_model(
             n_vars=args.num_nodes,
@@ -71,17 +71,17 @@ class DiBS_BGe(PosteriorModel):
         )
 
         # SVGD + DiBS hyperparams
-        self.n_particles = 20
+        self.n_particles = args.n_particles
         self.n_steps = lambda t: 3000 #int(100*t/15)
 
         # initialize kernel and algorithm
-        kernel = FrobeniusSquaredExponentialKernel(h=5.0)
+        kernel = FrobeniusSquaredExponentialKernel(h=args.h_latent)
 
         self.model = MarginalDiBS(
             kernel=kernel,
             target_log_prior=log_prior,
             target_log_marginal_prob=log_likelihood,
-            alpha_linear=0.1,
+            alpha_linear=args.alpha_linear,
         )
 
         self.key, subk = random.split(self.key)
@@ -133,11 +133,12 @@ class DiBS_BGe(PosteriorModel):
 
     def update_dist(self, data, interv_targets):
         particles_g = self.model.particle_to_g_lim(self.particles_z)
-        self.posterior = particle_marginal_empirical(particles_g)
-        #self.posterior = particle_marginal_mixture(
-        #    particles_g, self.eltwise_log_prob, data, interv_targets
-        #)
-        self.dags = self.posterior[0]
+        # self.posterior = particle_marginal_empirical(particles_g)
+        self.posterior = particle_marginal_mixture(
+           particles_g, self.eltwise_log_prob, data, interv_targets
+        )
+        # self.is_dag = elwise_acyclic_constr_nograd(self.posterior[0], self.num_nodes) == 0
+        # print(f'{self.posterior[0]}\n{self.posterior[1]}\n{particles_g.shape}\n{self.particles_z.shape}')
 
 
     def sample(self, num_samples):
